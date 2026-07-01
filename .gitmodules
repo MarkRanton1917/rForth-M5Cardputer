@@ -1,0 +1,3 @@
+[submodule "components/rforth"]
+	path = components/rforth
+	url = https://github.com/MarkRanton1917/rForth.git
