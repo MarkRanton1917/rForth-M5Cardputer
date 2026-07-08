@@ -29,8 +29,7 @@ else()
     set(COMPONENT_REQUIRES nvs_flash efuse)
 endif()
 
-### If you use arduino-esp32 components, please activate next comment line.
-# list(APPEND COMPONENT_REQUIRES arduino-esp32)
+list(APPEND COMPONENT_REQUIRES arduino)
 
 
 message(STATUS "M5GFX use components = ${COMPONENT_REQUIRES}")

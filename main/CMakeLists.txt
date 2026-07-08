@@ -6,4 +6,5 @@ idf_component_register(
   REQUIRES
     arduino
     m5cardputer
+    rforth
 )
