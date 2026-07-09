@@ -4,7 +4,7 @@
 
 #define HIST_DISP_LENGTH 5
 #define HIST_LENGTH 128
-#define MAX_STRING_LENGTH 19
+#define MAX_STRING_LENGTH 18
 #define X_OFFSET 4
 #define Y_OFFSET 8
 #define FORTH_BUFFER_SIZE 128
@@ -86,6 +86,7 @@ extern "C" void app_main()
   int step = display.height() / HIST_DISP_LENGTH;
 
   auto print_hist = [&](int offset = 0) {
+    assert(offset >= 0);
     int pos = 1;
     display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
     for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1 - offset; i < HIST_LENGTH - offset; i++) {
@@ -94,10 +95,28 @@ extern "C" void app_main()
     }
   };
 
-  auto print_input = [&]() {
+  int cursor = 0;
+  bool cursorVisiblePrev = false;
+  int cursorTime = millis();
+
+  auto print_input = [&](int offset = 0, bool cursorVisible = true) {
+    assert(offset >= 0);
     display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
     display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
-    display.print(input);
+    String p;
+    if (offset > 0)
+      p = "> " + input.substring(2 + offset);
+    else
+      p = input;
+
+    if (cursorVisible) {
+      if (cursor < input.length() - 2)
+        p[cursor + 2 - offset] = '_';
+      else
+        p += '_';
+    }
+
+    display.print(p);
   };
 
   mem_stat();
@@ -109,52 +128,84 @@ extern "C" void app_main()
   input = "> ";
   print_input();
 
-  int offset = 0;
+  int histOffset = 0;
   for (;;) {
+    bool keyboardEventOccured = false;
     M5Cardputer.update();
-    if (keyboard.isChange()) {
-      if (keyboard.isPressed()) {
-        Keyboard_Class::KeysState status = keyboard.keysState();
-        for (auto i : status.word) {
+    if (keyboard.isChange() && keyboard.isPressed()) {
+      keyboardEventOccured = true;
+      Keyboard_Class::KeysState status = keyboard.keysState();
+      for (auto i : status.word) {
+        if (cursor < input.length() - 2)
+          input[cursor + 2] = i;
+        else
           input += i;
-        }
+        cursor++;
+        cursorTime = millis();
+      }
 
-        if (status.del) {
-          input.remove(input.length() - 1);
-        }
-
-        if (status.up) {
-          if (offset < HIST_LENGTH - HIST_DISP_LENGTH) {
-            offset++;
-            print_hist(offset);
-          }
-        }
-
-        if (status.down) {
-          if (offset > 0) {
-            offset--;
-            print_hist(offset);
-          }
-        }
-
-        if (status.enter) {
-          offset = 0;
-          input = input.substring(2);
-
-          forth_vm(input.c_str(), forth_output);
-          input += output;
-
-          add_history_lines(input);
-          print_hist();
-          output = "";
-          input = "> ";
-          print_input();
-        }
-        else {
-          print_input();
+      if (status.del) {
+        int len = input.length();
+        if (len > 2) {
+          if (cursor < len - 2)
+            input.remove(cursor + 2, 1);
+          else
+            input.remove(len - 1);
         }
       }
+
+      if (status.up) {
+        if (histOffset < HIST_LENGTH - HIST_DISP_LENGTH) {
+          histOffset++;
+          print_hist(histOffset);
+        }
+      }
+
+      if (status.down) {
+        if (histOffset > 0) {
+          histOffset--;
+          print_hist(histOffset);
+        }
+      }
+
+      if (status.left) {
+        if (cursor > 0) {
+          cursor--;
+          cursorTime = millis();
+        }
+      }
+
+      if (status.right) {
+        if (cursor < input.length() - 2) {
+          cursor++;
+          cursorTime = millis();
+        }
+      }
+
+      if (status.enter) {
+        histOffset = 0;
+        input = input.substring(2);
+
+        forth_vm(input.c_str(), forth_output);
+        input += " " + output;
+
+        add_history_lines(input);
+        print_hist();
+        output = "";
+        input = "> ";
+        cursor = 0;
+        cursorTime = millis();
+        print_input();
+      }
     }
-    vTaskDelay(1);
+
+    bool cursorVisible = (millis() - cursorTime) / 1000 % 2 == 0;
+    if (keyboardEventOccured || cursorVisiblePrev != cursorVisible) {
+      cursorVisiblePrev = cursorVisible;
+      int inputOffset = cursor - MAX_STRING_LENGTH;
+      inputOffset = inputOffset > 0 ? inputOffset : 0;
+      print_input(inputOffset, cursorVisible);
+    }
+    vTaskDelay(100);
   }
 }
