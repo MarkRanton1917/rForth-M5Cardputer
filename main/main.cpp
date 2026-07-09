@@ -4,6 +4,7 @@
 
 #define HIST_DISP_LENGTH 5
 #define HIST_LENGTH 128
+#define MAX_STRING_LENGTH 19
 #define X_OFFSET 4
 #define Y_OFFSET 8
 #define FORTH_BUFFER_SIZE 128
@@ -33,29 +34,30 @@ bool forth_include(const char* fname)
   return false;
 }
 
-void add_lines(const String& input)
+static void add_history_lines(const String& input)
 {
-  int start = 0;
-  int end = input.indexOf('\n');
-  while (end != -1) {
-    String line = input.substring(start, end);
-    if (line.length() > 0) {
-      for (int i = 0; i < HIST_LENGTH - 1; i++) {
-        history[i] = history[i + 1];
-      }
-      history[HIST_LENGTH - 1] = line;
-    }
-    start = end + 1;
-    end = input.indexOf('\n', start);
-  }
+  int len = input.length();
+  int pos = 0;
 
-  if (start < input.length()) {
-    String line = input.substring(start);
-    if (line.length() > 0) {
+  while (pos < len) {
+    String chunk;
+    int count = 0;
+
+    if (input[pos] == '\n') pos++;
+
+    while (pos < len && count < MAX_STRING_LENGTH) {
+      char c = input[pos];
+      if (c == '\n') break;
+      chunk += c;
+      count++;
+      pos++;
+    }
+
+    if (chunk.length() > 0) {
       for (int i = 0; i < HIST_LENGTH - 1; i++) {
         history[i] = history[i + 1];
       }
-      history[HIST_LENGTH - 1] = line;
+      history[HIST_LENGTH - 1] = chunk;
     }
   }
 }
@@ -66,9 +68,9 @@ extern "C" void app_main()
 
   String input;
   for (auto& t : history) {
-    t.reserve(24);
+    t.reserve(MAX_STRING_LENGTH);
   }
-  input.reserve(24);
+  input.reserve(MAX_STRING_LENGTH + 2);
   output.reserve(256);
 
   auto cfg = M5.config();
@@ -83,14 +85,23 @@ extern "C" void app_main()
 
   int step = display.height() / HIST_DISP_LENGTH;
 
-  input = "> ";
-  display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
-  display.print(input);
+  auto print_all = [&]() {
+    display.fillRect(0, 0, display.width(), display.height(), BLACK);
+    int pos = 1;
+    for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1; i < HIST_LENGTH; i++) {
+      display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
+      display.print(history[i]);
+    }
+    output = "";
+    input = "> ";
+    display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
+    display.print(input);
+  };
 
   mem_stat();
   display.setCursor(X_OFFSET, step / 2 - Y_OFFSET);
-  display.print(output);
-  output = "";
+  add_history_lines(output);
+  print_all();
 
   for (;;) {
     M5Cardputer.update();
@@ -111,21 +122,14 @@ extern "C" void app_main()
           forth_vm(input.c_str(), forth_output);
           input += output;
 
-          add_lines(input);
-
-          input = "> ";
-          M5Cardputer.Display.fillRect(0, 0, display.width(), display.height(), BLACK);
-          int pos = 1;
-          for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1; i < HIST_LENGTH; i++) {
-            display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
-            M5Cardputer.Display.print(history[i]);
-          }
-          output = "";
+          add_history_lines(input);
+          print_all();
         }
-
-        M5Cardputer.Display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
-        display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
-        display.print(input);
+        else {
+          display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
+          display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
+          display.print(input);
+        }
       }
     }
     vTaskDelay(1);
