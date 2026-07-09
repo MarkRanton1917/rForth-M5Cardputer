@@ -85,15 +85,17 @@ extern "C" void app_main()
 
   int step = display.height() / HIST_DISP_LENGTH;
 
-  auto print_all = [&]() {
-    display.fillRect(0, 0, display.width(), display.height(), BLACK);
+  auto print_hist = [&](int offset = 0) {
     int pos = 1;
-    for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1; i < HIST_LENGTH; i++) {
+    display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
+    for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1 - offset; i < HIST_LENGTH - offset; i++) {
       display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
       display.print(history[i]);
     }
-    output = "";
-    input = "> ";
+  };
+
+  auto print_input = [&]() {
+    display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
     display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
     display.print(input);
   };
@@ -101,8 +103,13 @@ extern "C" void app_main()
   mem_stat();
   display.setCursor(X_OFFSET, step / 2 - Y_OFFSET);
   add_history_lines(output);
-  print_all();
+  print_hist();
+  output = "";
 
+  input = "> ";
+  print_input();
+
+  int offset = 0;
   for (;;) {
     M5Cardputer.update();
     if (keyboard.isChange()) {
@@ -116,19 +123,35 @@ extern "C" void app_main()
           input.remove(input.length() - 1);
         }
 
+        if (status.up) {
+          if (offset < HIST_LENGTH - HIST_DISP_LENGTH) {
+            offset++;
+            print_hist(offset);
+          }
+        }
+
+        if (status.down) {
+          if (offset > 0) {
+            offset--;
+            print_hist(offset);
+          }
+        }
+
         if (status.enter) {
+          offset = 0;
           input = input.substring(2);
 
           forth_vm(input.c_str(), forth_output);
           input += output;
 
           add_history_lines(input);
-          print_all();
+          print_hist();
+          output = "";
+          input = "> ";
+          print_input();
         }
         else {
-          display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
-          display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
-          display.print(input);
+          print_input();
         }
       }
     }
