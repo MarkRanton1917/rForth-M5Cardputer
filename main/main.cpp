@@ -148,15 +148,23 @@ extern "C" void app_main()
         int len = input.length();
         int pos = cursor + 2;
         if (len > 2 && pos < len) input = input.substring(0, pos) + " " + input.substring(pos);
+        cursorTime = millis();
       }
 
       if (status.del) {
         int len = input.length();
-        if (len > 2) {
-          if (cursor < len - 2)
-            input.remove(cursor + 2, 1);
-          else
-            input.remove(len - 1);
+        int pos = cursor + 2;
+        if (len > 2 && pos < len) input.remove(pos, 1);
+        cursorTime = millis();
+      }
+
+      if (status.backspace) {
+        int len = input.length();
+        int pos = cursor + 2;
+        if (len > 2 && pos <= len) {
+          input.remove(pos - 1, 1);
+          cursor--;
+          cursorTime = millis();
         }
       }
 
