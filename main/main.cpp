@@ -144,6 +144,12 @@ extern "C" void app_main()
         cursorTime = millis();
       }
 
+      if (status.opt) {
+        int len = input.length();
+        int pos = cursor + 2;
+        if (len > 2 && pos < len) input = input.substring(0, pos) + " " + input.substring(pos);
+      }
+
       if (status.del) {
         int len = input.length();
         if (len > 2) {
