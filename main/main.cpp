@@ -43,10 +43,15 @@ static void add_history_lines(const String& input)
     String chunk;
     int count = 0;
 
-    if (input[pos] == '\n') pos++;
+    while (input[pos] == '\n')
+      pos++;
 
     while (pos < len && count < MAX_STRING_LENGTH) {
       char c = input[pos];
+      if (c == '\r') {
+        pos++;
+        continue;
+      }
       if (c == '\n') break;
       chunk += c;
       count++;
@@ -67,11 +72,6 @@ extern "C" void app_main()
   forth_init();
 
   String input;
-  for (auto& t : history) {
-    t.reserve(MAX_STRING_LENGTH);
-  }
-  input.reserve(MAX_STRING_LENGTH + 2);
-  output.reserve(256);
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -129,6 +129,7 @@ extern "C" void app_main()
   print_input();
 
   int histOffset = 0;
+
   for (;;) {
     bool keyboardEventOccured = false;
     M5Cardputer.update();
