@@ -20,12 +20,17 @@
 #define Y_OFFSET 8
 #define FORTH_BUFFER_SIZE 128
 
-String output;
 String history[HIST_LENGTH];
+
+static void add_history_lines(String input);
+static void print_hist(int offset = 0);
+static void hw_init();
 
 void forth_output(int size, const char* msg)
 {
-  output += msg;
+  (void)size;
+  add_history_lines(msg);
+  print_hist();
 }
 
 void mem_stat()
@@ -36,8 +41,9 @@ void mem_stat()
   float percent = static_cast<float>(p) * 0.1;
   int core = xPortGetCoreID();
   int freq = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-  output += "rForth on core[" + String(core) + "]\nat " + String(freq) + "MHz,\nRAM " + String(percent) + "% free\n("
-    + String(f >> 10) + "/" + String(t >> 10) + " KB)";
+  String out = "rForth on core[" + String(core) + "]\nat " + String(freq) + "MHz,\nRAM " + String(percent) + "% free\n("
+    + String(f >> 10) + "/" + String(t >> 10) + " KB)\n";
+  forth_output(out.length(), out.c_str());
 }
 
 bool forth_include(const char* fname)
@@ -78,49 +84,6 @@ bool forth_include(const char* fname)
   return true;
 }
 
-static void add_history_lines(const String& input)
-{
-  int len = input.length();
-  int pos = 0;
-
-  while (pos < len) {
-    String chunk;
-    int count = 0;
-
-    while (input[pos] == '\n')
-      pos++;
-
-    while (pos < len && count < MAX_STRING_LENGTH) {
-      char c = input[pos];
-      if (c == '\r') {
-        pos++;
-        continue;
-      }
-      if (c == '\n') break;
-      chunk += c;
-      count++;
-      pos++;
-    }
-
-    if (chunk.length() > 0) {
-      for (int i = 0; i < HIST_LENGTH - 1; i++) {
-        history[i] = history[i + 1];
-      }
-      history[HIST_LENGTH - 1] = chunk;
-    }
-  }
-}
-
-static void hw_init()
-{
-  Serial.begin(115200);
-
-  auto cfg = M5.config();
-  M5Cardputer.begin(cfg, true);
-
-  SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
-}
-
 extern "C" void app_main()
 {
   hw_init();
@@ -134,18 +97,9 @@ extern "C" void app_main()
   display.setTextSize(1);
   display.setFont(&fonts::FreeMono9pt7b);
   display.setTextColor(ORANGE);
+  display.setTextScroll(false);
 
   int step = display.height() / HIST_DISP_LENGTH;
-
-  auto print_hist = [&](int offset = 0) {
-    assert(offset >= 0);
-    int pos = 1;
-    display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
-    for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1 - offset; i < HIST_LENGTH - offset; i++) {
-      display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
-      display.print(history[i]);
-    }
-  };
 
   int cursor = 0;
   bool cursorVisiblePrev = false;
@@ -172,11 +126,6 @@ extern "C" void app_main()
   };
 
   mem_stat();
-  display.setCursor(X_OFFSET, step / 2 - Y_OFFSET);
-  add_history_lines(output);
-  print_hist();
-  output = "";
-
   input = "> ";
   print_input();
 
@@ -252,13 +201,10 @@ extern "C" void app_main()
       if (status.enter) {
         histOffset = 0;
         input = input.substring(2);
+        add_history_lines(input + " ");
 
         forth_vm(input.c_str(), forth_output);
-        input += " " + output;
-
-        add_history_lines(input);
         print_hist();
-        output = "";
         input = "> ";
         cursor = 0;
         cursorTime = millis();
@@ -275,4 +221,68 @@ extern "C" void app_main()
     }
     vTaskDelay(100);
   }
+}
+
+static void add_history_lines(String input)
+{
+  input.replace("\r", "");
+  int iLen = input.length();
+
+  auto append = [&](String& target, int& pos) {
+    int tLen = target.length();
+    while (pos < iLen && tLen < MAX_STRING_LENGTH) {
+      char c = input[pos];
+      if (c == '\n') {
+        target += '\n';
+        pos++;
+        return;
+      }
+      target += c;
+      pos++;
+      tLen++;
+    }
+  };
+
+  int pos = 0;
+
+  String& last = history[HIST_LENGTH - 1];
+  if (last.length() > 0 && last[last.length() - 1] != '\n' && last.length() < MAX_STRING_LENGTH) {
+    append(last, pos);
+  }
+
+  while (pos < iLen) {
+    String chunk;
+    append(chunk, pos);
+    int cLen = chunk.length();
+    if (cLen > 0) {
+      for (int i = 0; i < HIST_LENGTH - 1; i++) {
+        history[i] = history[i + 1];
+      }
+      history[HIST_LENGTH - 1] = chunk;
+    }
+    if (cLen == MAX_STRING_LENGTH && input[pos] == '\n') pos++;
+  }
+}
+
+static void print_hist(int offset)
+{
+  assert(offset >= 0);
+  M5GFX& display = M5Cardputer.Display;
+  int step = display.height() / HIST_DISP_LENGTH;
+  int pos = 1;
+  display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
+  for (int i = HIST_LENGTH - HIST_DISP_LENGTH + 1 - offset; i < HIST_LENGTH - offset; i++) {
+    display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
+    display.print(history[i]);
+  }
+};
+
+static void hw_init()
+{
+  Serial.begin(115200);
+
+  auto cfg = M5.config();
+  M5Cardputer.begin(cfg, true);
+
+  SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
 }
