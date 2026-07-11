@@ -5,6 +5,13 @@
 #include "rForth.h"
 #include "M5Cardputer.h"
 #include "M5GFX.h"
+#include "SPI.h"
+#include "SD.h"
+
+#define SD_SPI_SCK_PIN  40
+#define SD_SPI_MISO_PIN 39
+#define SD_SPI_MOSI_PIN 14
+#define SD_SPI_CS_PIN   12
 
 #define HIST_DISP_LENGTH 5
 #define HIST_LENGTH 128
@@ -35,7 +42,40 @@ void mem_stat()
 
 bool forth_include(const char* fname)
 {
-  return false;
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
+    Serial.println("forth_include: SD card failed or not present");
+    return false;
+  }
+
+  File file = SD.open(fname);
+  if (!file) {
+    Serial.println("forth_include: failed to open file for reading");
+    SD.end();
+    return false;
+  }
+
+  auto dumb = [](int, const char*) {};
+
+  String cmd;
+  while (file.available()) {
+    int r = file.read();
+    if (r == -1) {
+      Serial.println("forth_include: failed to read file");
+      file.close();
+      SD.end();
+      return false;
+    }
+    if (r == '\n') {
+      forth_vm(cmd.c_str(), dumb);
+      cmd = "";
+    }
+    else
+      cmd += (char)r;
+  }
+
+  file.close();
+  SD.end();
+  return true;
 }
 
 static void add_history_lines(const String& input)
@@ -71,14 +111,22 @@ static void add_history_lines(const String& input)
   }
 }
 
-extern "C" void app_main()
+static void hw_init()
 {
-  forth_init();
-
-  String input;
+  Serial.begin(115200);
 
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
+
+  SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+}
+
+extern "C" void app_main()
+{
+  hw_init();
+  forth_init();
+
+  String input;
 
   M5GFX& display = M5Cardputer.Display;
   Keyboard_Class& keyboard = M5Cardputer.Keyboard;
