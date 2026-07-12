@@ -1,12 +1,15 @@
 // Copyright (c) 2026 Vladimir Egorov
 // This project is licensed under the MIT License.
 // See the LICENSE file in the root of the repository for the full license text.
+#include "utils.h"
 
 #include "rForth.h"
 #include "M5Cardputer.h"
 #include "M5GFX.h"
 #include "SPI.h"
 #include "SD.h"
+#include "Preferences.h"
+#include "nvs_flash.h"
 
 #define SD_SPI_SCK_PIN  40
 #define SD_SPI_MISO_PIN 39
@@ -21,13 +24,17 @@
 #define Y_OFFSET 8
 #define FORTH_BUFFER_SIZE 128
 
-String ohistory[OHIST_LENGTH];
-String ihistory[IHIST_LENGTH];
+RingList<String, OHIST_LENGTH> ohist;
+RingList<String, IHIST_LENGTH> ihist;
+size_t ihistPos = 0;
+size_t ihistCount = 0;
 
 static void add_ohistory_lines(String input);
 static void add_ihistory_lines(String input);
 static void print_hist(int offset = 0);
+static bool is_graph(const String& str);
 static void hw_init();
+static void ihist_init();
 
 void forth_output(int size, const char* msg)
 {
@@ -90,6 +97,7 @@ bool forth_include(const char* fname)
 extern "C" void app_main()
 {
   hw_init();
+  ihist_init();
   forth_init();
 
   String input;
@@ -103,7 +111,7 @@ extern "C" void app_main()
   display.setTextColor(ORANGE);
   display.setTextScroll(false);
 
-  int step = display.height() / OHIST_DISP_LENGTH;
+  int step = display.height() / (OHIST_DISP_LENGTH + 1);
 
   int cursor = 0;
   bool cursorVisiblePrev = false;
@@ -135,7 +143,6 @@ extern "C" void app_main()
 
   int ohistOffset = 0;
   int ihistOffset = 0;
-  int ihistMax = 0;
   for (;;) {
     bool keyboardEventOccured = false;
     M5Cardputer.update();
@@ -176,8 +183,9 @@ extern "C" void app_main()
       }
 
       if (status.up) {
-        if (ohistOffset < OHIST_LENGTH - OHIST_DISP_LENGTH) {
-          ohistOffset++;
+        int maxOffset = std::max(0, (int)ohist.size() - OHIST_DISP_LENGTH);
+        if (ohistOffset < maxOffset) {
+          ++ohistOffset;
           print_hist(ohistOffset);
         }
       }
@@ -205,9 +213,10 @@ extern "C" void app_main()
 
       if (status.f11) {
         if (ihistOffset == 0) inputIhist = input.substring(2);
-        if (ihistOffset < IHIST_LENGTH - 1 && ihistOffset < ihistMax) {
+
+        if (ihistOffset < ihist.size()) {
           ihistOffset++;
-          String cmd = ihistory[IHIST_LENGTH - ihistOffset];
+          String cmd = ihist[ihist.size() - ihistOffset];
           input = "> " + cmd;
           cursor = cmd.length();
           cursorTime = millis();
@@ -216,9 +225,9 @@ extern "C" void app_main()
 
       if (status.f12) {
         String cmd;
-        if (ihistOffset != 0) {
+        if (ihistOffset > 0) {
           ihistOffset--;
-          cmd = ihistOffset ? ihistory[IHIST_LENGTH - ihistOffset] : inputIhist;
+          cmd = ihistOffset ? ihist[ihist.size() - ihistOffset] : inputIhist;
           input = "> " + cmd;
           cursor = cmd.length();
           cursorTime = millis();
@@ -230,17 +239,12 @@ extern "C" void app_main()
         ihistOffset = 0;
 
         String cmd = input.substring(2);
-        for (int i = 0; i < cmd.length(); i++) {
-          if (isGraph(cmd.charAt(i))) {
-            ihistMax++;
-            add_ihistory_lines(cmd);
-            break;
-          }
+        if (is_graph(cmd)) {
+          add_ihistory_lines(cmd);
         }
         add_ohistory_lines(cmd + " ");
-
-        forth_vm(cmd.c_str(), forth_output);
         print_hist();
+        forth_vm(cmd.c_str(), forth_output);
 
         input = "> ";
         cursor = 0;
@@ -282,8 +286,9 @@ static void add_ohistory_lines(String input)
 
   int pos = 0;
 
-  String& last = ohistory[OHIST_LENGTH - 1];
-  if (last.length() > 0 && last[last.length() - 1] != '\n' && last.length() < MAX_STRING_LENGTH) {
+  String& last = ohist.newest();
+  int lLen = last.length();
+  if (lLen > 0 && last[lLen - 1] != '\n' && lLen < MAX_STRING_LENGTH) {
     append(last, pos);
   }
 
@@ -292,10 +297,7 @@ static void add_ohistory_lines(String input)
     append(chunk, pos);
     int cLen = chunk.length();
     if (cLen > 0) {
-      for (int i = 0; i < OHIST_LENGTH - 1; i++) {
-        ohistory[i] = ohistory[i + 1];
-      }
-      ohistory[OHIST_LENGTH - 1] = chunk;
+      ohist.push(chunk);
     }
     if (cLen == MAX_STRING_LENGTH && input[pos] == '\n') pos++;
   }
@@ -303,24 +305,49 @@ static void add_ohistory_lines(String input)
 
 static void add_ihistory_lines(String input)
 {
-  for (int i = 0; i < IHIST_LENGTH - 1; i++) {
-    ihistory[i] = ihistory[i + 1];
-  }
-  ihistory[IHIST_LENGTH - 1] = input;
+  ihist.push(input);
+  Preferences pref;
+  pref.begin("ihist", false);
+  String key = "h" + String(ihistPos);
+  pref.putString(key.c_str(), input);
+
+  ihistPos++;
+  if (ihistPos >= IHIST_LENGTH) ihistPos = 0;
+  if (ihistCount < IHIST_LENGTH) ihistCount++;
+
+  pref.putUInt("ihistPos", ihistPos);
+  pref.putUInt("ihistCount", ihistCount);
+  pref.end();
 }
 
 static void print_hist(int offset)
 {
   assert(offset >= 0);
+  assert(ohist.size());
+  assert(ohist.size() >= offset);
   M5GFX& display = M5Cardputer.Display;
-  int step = display.height() / OHIST_DISP_LENGTH;
+  int step = display.height() / (OHIST_DISP_LENGTH + 1);
   int pos = 1;
+
   display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
-  for (int i = OHIST_LENGTH - OHIST_DISP_LENGTH + 1 - offset; i < OHIST_LENGTH - offset; i++) {
+
+  int end = ohist.size() - offset;
+
+  int begin = end - OHIST_DISP_LENGTH;
+  if (begin < 0) begin = 0;
+
+  for (int i = begin; i < end; i++) {
     display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
-    display.print(ohistory[i]);
+    display.print(ohist[i]);
   }
-};
+}
+static bool is_graph(const String& str)
+{
+  for (int i = 0; i < str.length(); i++) {
+    if (isGraph(str[i])) return true;
+  }
+  return false;
+}
 
 static void hw_init()
 {
@@ -329,5 +356,39 @@ static void hw_init()
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
 
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(err);
+
   SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+}
+
+
+static void ihist_init()
+{
+  Preferences pref;
+  pref.begin("ihist", true);
+  ihistPos = pref.getUInt("ihistPos", 0);
+  ihistCount = pref.getUInt("ihistCount", 0);
+
+  if (ihistCount > IHIST_LENGTH) ihistCount = IHIST_LENGTH;
+
+  size_t start;
+
+  if (ihistCount == IHIST_LENGTH)
+    start = ihistPos;
+  else
+    start = 0;
+
+
+  for (size_t i = 0; i < ihistCount; i++) {
+    size_t index = (start + i) % IHIST_LENGTH;
+    String key = "h" + String(index);
+    String cmd = pref.getString(key.c_str(), "");
+    if (cmd.length()) ihist.push(cmd);
+  }
+  pref.end();
 }
