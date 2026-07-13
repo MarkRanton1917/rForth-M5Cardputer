@@ -12,6 +12,9 @@
 // Default interrupt pin for M5Cardputer ADV
 #define DEFAULT_TCA8418_INT_PIN 11
 
+// Sentinel value marking an invalid / discarded key event
+static constexpr uint8_t INVALID_ROW = 0xFF;
+
 TCA8418KeyboardReader::TCA8418KeyboardReader(int interrupt_pin) : _isr_flag(false), _interrupt_pin(interrupt_pin)
 {
     if (_interrupt_pin < 0) {
@@ -35,8 +38,25 @@ void TCA8418KeyboardReader::begin()
         return;
     }
 
-    // Setup
+    // Setup keypad matrix
     _tca8418->matrix(7, 8);
+
+    // IMPORTANT: matrix() only touches KP_GPIO_1..3 (which pins belong to
+    // the matrix). The pins used by the matrix are still left configured
+    // as GPIO-event/interrupt sources from Adafruit_TCA8418::begin()
+    // (GPI_EM = 0xFF, GPIO_INT_EN = 0xFF). That means matrix pins can
+    // raise a GPI interrupt (bit 0x02 in INT_STAT) in addition to the
+    // normal key event interrupt (bit 0x01) -- and GPI_INT is never
+    // cleared anywhere, so the INT line can get stuck low once it fires.
+    // Disable GPIO-event/interrupt generation entirely; we only care
+    // about keypad matrix events here.
+    _tca8418->writeRegister8(TCA8418_REG_GPI_EM_1, 0x00);
+    _tca8418->writeRegister8(TCA8418_REG_GPI_EM_2, 0x00);
+    _tca8418->writeRegister8(TCA8418_REG_GPI_EM_3, 0x00);
+    _tca8418->writeRegister8(TCA8418_REG_GPIO_INT_EN_1, 0x00);
+    _tca8418->writeRegister8(TCA8418_REG_GPIO_INT_EN_2, 0x00);
+    _tca8418->writeRegister8(TCA8418_REG_GPIO_INT_EN_3, 0x00);
+
     _tca8418->flush();
 
     // Setup interrupt pin
@@ -55,36 +75,67 @@ void TCA8418KeyboardReader::update()
         return;
     }
 
-    _key_event_raw_buffer = get_key_event_raw(_tca8418->getEvent());
+    while (true) {
+        uint8_t raw = _tca8418->getEvent();
 
-    //  try to clear the IRQ flag
-    //  if there are pending events it is not cleared
-    _tca8418->writeRegister8(TCA8418_REG_INT_STAT, 1);
-    int intstat = _tca8418->readRegister8(TCA8418_REG_INT_STAT);
-    if ((intstat & 0x01) == 0) {
-        _isr_flag = false;
+        if (raw == 0) {
+            break;
+        }
+
+        KeyEventRaw_t event = get_key_event_raw(raw);
+
+        if (event.row == INVALID_ROW) {
+            continue;
+        }
+
+        remap(event);
+        update_key_list(event);
     }
 
-    remap(_key_event_raw_buffer);
-    // printf("key event raw: (%d, %d): %d\n", _key_event_raw_buffer.row, _key_event_raw_buffer.col,
-    //        _key_event_raw_buffer.state);
+    _tca8418->writeRegister8(TCA8418_REG_INT_STAT, 0x1F);
 
-    update_key_list(_key_event_raw_buffer);
+    if ((_tca8418->readRegister8(TCA8418_REG_INT_STAT) & 0x01) == 0) {
+        _isr_flag = false;
+    }
 }
 
 TCA8418KeyboardReader::KeyEventRaw_t TCA8418KeyboardReader::get_key_event_raw(const uint8_t& eventRaw)
 {
     KeyEventRaw_t ret;
+
+    // 0x00 means "no event available" -- getEvent() can legitimately
+    // return this, e.g. if update() is invoked without a real pending
+    // event. Treat it as invalid rather than letting the row/col math
+    // below produce a wraparound value.
+    if (eventRaw == 0x00) {
+        ret.row = INVALID_ROW;
+        return ret;
+    }
+
     ret.state       = eventRaw & 0x80;
-    uint16_t buffer = eventRaw;
-    buffer &= 0x7F;
-    buffer--;
-    ret.row = buffer / 10;
-    ret.col = buffer % 10;
+    uint16_t buffer = eventRaw & 0x7F;
+    buffer--;  // event codes are 1-based
+
+    uint8_t row = buffer / 10;
+    uint8_t col = buffer % 10;
+
+    // matrix(7, 8) means only row 0..6 and col 0..7 are valid. Anything
+    // outside that range is a corrupt/spurious event (can happen under
+    // electrical stress from many simultaneous key contacts) and must be
+    // discarded rather than passed on to remap()/update_key_list(), where
+    // it would eventually index out of bounds into _key_value_map[4][14]
+    // in Keyboard.cpp.
+    if (row > 6 || col > 7) {
+        ret.row = INVALID_ROW;
+        return ret;
+    }
+
+    ret.row = row;
+    ret.col = col;
     return ret;
 }
 
-// Remap to the same as cardputer
+// Remap to the same layout as cardputer
 void TCA8418KeyboardReader::remap(KeyEventRaw_t& key)
 {
     // Col
@@ -102,6 +153,12 @@ void TCA8418KeyboardReader::remap(KeyEventRaw_t& key)
 
 void TCA8418KeyboardReader::update_key_list(const KeyEventRaw_t& eventRaw)
 {
+    // Defensive: should already be filtered out in update(), but keep this
+    // as a safety net in case update_key_list() is ever called directly.
+    if (eventRaw.row == INVALID_ROW) {
+        return;
+    }
+
     Point2D_t point;
     point.x = eventRaw.col;
     point.y = eventRaw.row;

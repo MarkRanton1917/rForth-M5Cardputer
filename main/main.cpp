@@ -255,11 +255,9 @@ extern "C" void app_main()
     bool cursorVisible = (millis() - cursorTime) / 1000 % 2 == 0;
     if (keyboardEventOccured || cursorVisiblePrev != cursorVisible) {
       cursorVisiblePrev = cursorVisible;
-      int inputOffset = cursor - MAX_STRING_LENGTH;
-      inputOffset = inputOffset > 0 ? inputOffset : 0;
-      print_input(inputOffset, cursorVisible);
+      print_input(std::max(0, cursor - MAX_STRING_LENGTH), cursorVisible);
     }
-    vTaskDelay(100);
+    vTaskDelay(20);
   }
 }
 
