@@ -3,9 +3,13 @@
 // See the LICENSE file in the root of the repository for the full license text.
 #include "utils.h"
 
+#include <atomic>
 #include "rForth.h"
 #include "M5Cardputer.h"
 #include "M5GFX.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "SPI.h"
 #include "SD.h"
 #include "Preferences.h"
@@ -24,24 +28,32 @@
 #define Y_OFFSET 8
 #define FORTH_BUFFER_SIZE 128
 
-RingList<String, OHIST_LENGTH> ohist;
-RingList<String, IHIST_LENGTH> ihist;
-size_t ihistPos = 0;
-size_t ihistCount = 0;
+enum class InputMode {
+  EDITOR,
+  VM
+};
 
+static std::atomic<InputMode> mode = InputMode::EDITOR;
+static std::atomic<int> pendingSymbol = INPUT_NONE;
+static RingList<String, OHIST_LENGTH> ohist;
+static RingList<String, IHIST_LENGTH> ihist;
+static size_t ihistPos = 0;
+static size_t ihistCount = 0;
+static KeyQueue forthInput;
+
+static SemaphoreHandle_t forthInitSem = xSemaphoreCreateBinary();
+static SemaphoreHandle_t forthDoneSem = xSemaphoreCreateBinary();
+static SemaphoreHandle_t displayMux = xSemaphoreCreateMutex();
+
+static void forth_output(int size, const char* msg);
+static int forth_input();
+static void forth_task(void* ctx);
 static void add_ohistory_lines(String input);
 static void add_ihistory_lines(String input);
 static void print_hist(int offset = 0);
 static bool is_graph(const String& str);
 static void hw_init();
 static void ihist_init();
-
-void forth_output(int size, const char* msg)
-{
-  (void)size;
-  add_ohistory_lines(msg);
-  print_hist();
-}
 
 void mem_stat()
 {
@@ -70,8 +82,6 @@ bool forth_include(const char* fname)
     return false;
   }
 
-  auto dumb = [](int, const char*) {};
-
   String cmd;
   while (file.available()) {
     int r = file.read();
@@ -81,12 +91,11 @@ bool forth_include(const char* fname)
       SD.end();
       return false;
     }
+    cmd += (char)r;
     if (r == '\n') {
-      forth_vm(cmd.c_str(), dumb);
+      forth_interpret(cmd.c_str(), NULL);
       cmd = "";
     }
-    else
-      cmd += (char)r;
   }
 
   file.close();
@@ -98,7 +107,6 @@ extern "C" void app_main()
 {
   hw_init();
   ihist_init();
-  forth_init();
 
   String input;
   String inputIhist;
@@ -119,6 +127,7 @@ extern "C" void app_main()
 
   auto print_input = [&](int offset = 0, bool cursorVisible = true) {
     assert(offset >= 0);
+    xSemaphoreTake(displayMux, portMAX_DELAY);
     display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
     display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
     String p;
@@ -135,7 +144,11 @@ extern "C" void app_main()
     }
 
     display.print(p);
+    xSemaphoreGive(displayMux);
   };
+
+  xTaskCreate(forth_task, "ForthTask", 8192, nullptr, 1, nullptr);
+  xSemaphoreTake(forthInitSem, portMAX_DELAY);
 
   mem_stat();
   input = "> ";
@@ -143,29 +156,42 @@ extern "C" void app_main()
 
   int ohistOffset = 0;
   int ihistOffset = 0;
+
   for (;;) {
+    bool inputMode = (mode.load(std::memory_order_relaxed) == InputMode::EDITOR);
     bool keyboardEventOccured = false;
     M5Cardputer.update();
     if (keyboard.isChange() && keyboard.isPressed()) {
       keyboardEventOccured = true;
       Keyboard_Class::KeysState status = keyboard.keysState();
-      for (auto i : status.word) {
-        if (cursor < input.length() - 2)
-          input[cursor + 2] = i;
-        else
-          input += i;
-        cursor++;
-        cursorTime = millis();
+      if (status.word.size()) {
+        char c = status.word.back();
+        if (inputMode) {
+          if (cursor < input.length() - 2)
+            input[cursor + 2] = c;
+          else
+            input += c;
+          cursor++;
+          cursorTime = millis();
+        }
+        else {
+          pendingSymbol = (int)c;
+        }
       }
 
       if (status.opt) {
-        int len = input.length();
-        int pos = cursor + 2;
-        if (len > 2 && pos < len) input = input.substring(0, pos) + " " + input.substring(pos);
-        cursorTime = millis();
+        if (inputMode) {
+          int len = input.length();
+          int pos = cursor + 2;
+          if (len > 2 && pos < len) input = input.substring(0, pos) + " " + input.substring(pos);
+          cursorTime = millis();
+        }
+        else {
+          pendingSymbol = INPUT_BREAK;
+        }
       }
 
-      if (status.del) {
+      if (status.del && inputMode) {
         int len = input.length();
         int pos = cursor + 2;
         if (len > 2 && pos < len) input.remove(pos, 1);
@@ -173,16 +199,21 @@ extern "C" void app_main()
       }
 
       if (status.backspace) {
-        int len = input.length();
-        int pos = cursor + 2;
-        if (len > 2 && pos <= len) {
-          input.remove(pos - 1, 1);
-          cursor--;
-          cursorTime = millis();
+        if (inputMode) {
+          int len = input.length();
+          int pos = cursor + 2;
+          if (len > 2 && pos <= len) {
+            input.remove(pos - 1, 1);
+            cursor--;
+            cursorTime = millis();
+          }
+        }
+        else {
+          pendingSymbol = '\b';
         }
       }
 
-      if (status.up) {
+      if (status.up && inputMode) {
         int maxOffset = std::max(0, (int)ohist.size() - OHIST_DISP_LENGTH);
         if (ohistOffset < maxOffset) {
           ++ohistOffset;
@@ -190,28 +221,28 @@ extern "C" void app_main()
         }
       }
 
-      if (status.down) {
+      if (status.down && inputMode) {
         if (ohistOffset > 0) {
           ohistOffset--;
           print_hist(ohistOffset);
         }
       }
 
-      if (status.left) {
+      if (status.left && inputMode) {
         if (cursor > 0) {
           cursor--;
           cursorTime = millis();
         }
       }
 
-      if (status.right) {
+      if (status.right && inputMode) {
         if (cursor < input.length() - 2) {
           cursor++;
           cursorTime = millis();
         }
       }
 
-      if (status.f11) {
+      if (status.f11 && inputMode) {
         if (ihistOffset == 0) inputIhist = input.substring(2);
 
         if (ihistOffset < ihist.size()) {
@@ -223,7 +254,7 @@ extern "C" void app_main()
         }
       }
 
-      if (status.f12) {
+      if (status.f12 && inputMode) {
         String cmd;
         if (ihistOffset > 0) {
           ihistOffset--;
@@ -235,25 +266,30 @@ extern "C" void app_main()
       }
 
       if (status.enter) {
-        ohistOffset = 0;
-        ihistOffset = 0;
-
-        String cmd = input.substring(2);
-        if (is_graph(cmd)) {
-          add_ihistory_lines(cmd);
+        if (inputMode) {
+          ohistOffset = 0;
+          ihistOffset = 0;
+          String cmd = input.substring(2);
+          if (is_graph(cmd)) {
+            add_ihistory_lines(cmd);
+          }
+          add_ohistory_lines(cmd + " ");
+          print_hist();
+          input = "> ";
+          cursor = 0;
+          cursorTime = millis();
+          print_input();
+          cmd += '\n';
+          forthInput.load(cmd);
         }
-        add_ohistory_lines(cmd + " ");
-        print_hist();
-        input = "> ";
-        cursor = 0;
-        cursorTime = millis();
-        print_input();
-        forth_vm(cmd.c_str(), forth_output);
+        else {
+          pendingSymbol = '\n';
+        }
       }
     }
 
     bool cursorVisible = (millis() - cursorTime) / 1000 % 2 == 0;
-    if (keyboardEventOccured || cursorVisiblePrev != cursorVisible) {
+    if (inputMode && (keyboardEventOccured || cursorVisiblePrev != cursorVisible)) {
       cursorVisiblePrev = cursorVisible;
       print_input(std::max(0, cursor - MAX_STRING_LENGTH), cursorVisible);
     }
@@ -261,42 +297,94 @@ extern "C" void app_main()
   }
 }
 
+static void forth_output(int size, const char* msg)
+{
+  (void)size;
+  add_ohistory_lines(msg);
+  print_hist();
+}
+
+static int forth_input()
+{
+  if (forth_waiting_input()) {
+    return pendingSymbol.exchange(INPUT_NONE);
+  }
+  int sym = pendingSymbol.load();
+  if (sym == INPUT_BREAK) {
+    pendingSymbol.store(INPUT_NONE);
+    return INPUT_BREAK;
+  }
+  return forthInput.pop();
+}
+
+static void forth_task(void* ctx)
+{
+  (void)ctx;
+  forth_init();
+  xSemaphoreGive(forthInitSem);
+
+  for (;;) {
+    if (forthInput.size() > 0) {
+      mode.store(InputMode::VM);
+      while (forthInput.size() > 0)
+        forth_vm(forth_input, forth_output);
+      mode.store(InputMode::EDITOR);
+    }
+    vTaskDelay(10);
+  }
+}
+
 static void add_ohistory_lines(String input)
 {
   input.replace("\r", "");
-  int iLen = input.length();
+  if (input.isEmpty()) return;
 
-  auto append = [&](String& target, int& pos) {
-    int tLen = target.length();
-    while (pos < iLen && tLen < MAX_STRING_LENGTH) {
-      char c = input[pos];
-      if (c == '\n') {
-        target += '\n';
-        pos++;
-        return;
-      }
-      target += c;
-      pos++;
-      tLen++;
-    }
-  };
-
-  int pos = 0;
-
-  String& last = ohist.newest();
-  int lLen = last.length();
-  if (lLen > 0 && last[lLen - 1] != '\n' && lLen < MAX_STRING_LENGTH) {
-    append(last, pos);
+  bool haveOpenLine = false;
+  if (ohist.size() > 0) {
+    String& last = ohist.newest();
+    haveOpenLine = !last.isEmpty() && last[last.length() - 1] != '\n' && last.length() < MAX_STRING_LENGTH;
   }
 
-  while (pos < iLen) {
-    String chunk;
-    append(chunk, pos);
-    int cLen = chunk.length();
-    if (cLen > 0) {
-      ohist.push(chunk);
+  for (int pos = 0; pos < input.length();) {
+    char c = input[pos++];
+
+    if (c == '\n') {
+      if (haveOpenLine) {
+        String& line = ohist.newest();
+        if (!line.isEmpty() && line[line.length() - 1] != '\n') line += '\n';
+      }
+      haveOpenLine = false;
+      continue;
     }
-    if (cLen == MAX_STRING_LENGTH && input[pos] == '\n') pos++;
+
+    if (c == '\b') {
+      while (ohist.size() > 0) {
+        String& line = ohist.newest();
+        if (!line.isEmpty() && line[line.length() - 1] != '\n') {
+          line.remove(line.length() - 1);
+          haveOpenLine = true;
+          break;
+        }
+        if (line.isEmpty() && ohist.size() > 1) {
+          ohist.pull();
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+
+    if (!haveOpenLine) {
+      ohist.push("");
+      haveOpenLine = true;
+    }
+
+    String& line = ohist.newest();
+    line += c;
+
+    if (line.length() >= MAX_STRING_LENGTH) {
+      haveOpenLine = false;
+    }
   }
 }
 
@@ -322,6 +410,7 @@ static void print_hist(int offset)
   assert(offset >= 0);
   assert(ohist.size());
   assert(ohist.size() >= offset);
+  xSemaphoreTake(displayMux, portMAX_DELAY);
   M5GFX& display = M5Cardputer.Display;
   int step = display.height() / (OHIST_DISP_LENGTH + 1);
   int pos = 1;
@@ -336,6 +425,7 @@ static void print_hist(int offset)
     display.setCursor(X_OFFSET, step * pos++ - step / 2 - Y_OFFSET);
     display.print(ohist[i]);
   }
+  xSemaphoreGive(displayMux);
 }
 static bool is_graph(const String& str)
 {
@@ -362,7 +452,6 @@ static void hw_init()
   SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
 }
 
-
 static void ihist_init()
 {
   Preferences pref;
@@ -378,7 +467,6 @@ static void ihist_init()
     start = ihistPos;
   else
     start = 0;
-
 
   for (size_t i = 0; i < ihistCount; i++) {
     size_t index = (start + i) % IHIST_LENGTH;
