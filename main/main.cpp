@@ -244,12 +244,11 @@ extern "C" void app_main()
         }
         add_ohistory_lines(cmd + " ");
         print_hist();
-        forth_vm(cmd.c_str(), forth_output);
-
         input = "> ";
         cursor = 0;
         cursorTime = millis();
         print_input();
+        forth_vm(cmd.c_str(), forth_output);
       }
     }
 
@@ -332,7 +331,6 @@ static void print_hist(int offset)
   display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
 
   int end = ohist.size() - offset;
-
   int begin = end - OHIST_DISP_LENGTH;
   if (begin < 0) begin = 0;
 
