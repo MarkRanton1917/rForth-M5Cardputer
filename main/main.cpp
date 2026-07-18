@@ -63,8 +63,8 @@ void mem_stat()
   float percent = static_cast<float>(p) * 0.1;
   int core = xPortGetCoreID();
   int freq = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-  String out = "rForth on core[" + String(core) + "]\nat " + String(freq) + "MHz,\nRAM " + String(percent) + "% free\n("
-    + String(f >> 10) + "/" + String(t >> 10) + " KB)\n";
+  String out = "\nrForth on core[" + String(core) + "]\nat " + String(freq) + "MHz,\nRAM " + String(percent)
+    + "% free\n(" + String(f >> 10) + "/" + String(t >> 10) + " KB)\n";
   forth_output(out.length(), out.c_str());
 }
 
