@@ -26,7 +26,7 @@
 #define MAX_STRING_LENGTH 18
 #define X_OFFSET 4
 #define Y_OFFSET 8
-#define FORTH_BUFFER_SIZE 128
+#define GRAPH_TEXT_OFFSET 8
 
 enum class InputMode {
   EDITOR,
@@ -41,6 +41,9 @@ static size_t ihistPos = 0;
 static size_t ihistCount = 0;
 static KeyQueue forthInput;
 
+static std::atomic<bool> graphMode = false;
+static M5Canvas* graphCanvas = nullptr;
+
 static SemaphoreHandle_t forthInitSem = xSemaphoreCreateBinary();
 static SemaphoreHandle_t forthDoneSem = xSemaphoreCreateBinary();
 static SemaphoreHandle_t displayMux = xSemaphoreCreateMutex();
@@ -48,12 +51,144 @@ static SemaphoreHandle_t displayMux = xSemaphoreCreateMutex();
 static void forth_output(int size, const char* msg);
 static int forth_input();
 static void forth_task(void* ctx);
-static void add_ohistory_lines(String input);
-static void add_ihistory_lines(String input);
-static void print_hist(int offset = 0);
+static void ohist_add_lines(String input);
+static void ihist_add_lines(String input);
+static void ohist_print(int offset = 0);
 static bool is_graph(const String& str);
 static void hw_init();
 static void ihist_init();
+
+static inline int display_step()
+{
+  return M5Cardputer.Display.height() / (OHIST_DISP_LENGTH + 1);
+}
+
+static inline DU display_graph_width()
+{
+  return M5Cardputer.Display.width();
+}
+
+static inline DU display_graph_height()
+{
+  return M5Cardputer.Display.height() - display_step() / 2 - Y_OFFSET;
+}
+
+static const Code words[] = {
+  CODE("tone",
+    {
+      DU duration = ss_pop();
+      DU frequency = ss_pop();
+      M5Cardputer.Speaker.tone(frequency, duration);
+    }),
+  CODE(">graph",
+    {
+      graphMode.store(true);
+      if (!graphCanvas) {
+        graphCanvas = new M5Canvas(&M5Cardputer.Display);
+        graphCanvas->createSprite(display_graph_width(), display_graph_height());
+        graphCanvas->fillScreen(BLACK);
+        graphCanvas->setTextSize(1);
+        graphCanvas->setFont(&fonts::FreeMono9pt7b);
+        graphCanvas->setTextScroll(false);
+      }
+      xSemaphoreTake(displayMux, portMAX_DELAY);
+      graphCanvas->pushSprite(0, 0);
+      xSemaphoreGive(displayMux);
+    }),
+  CODE("graph>",
+    {
+      graphMode.store(false);
+      ohist_print();
+    }),
+  CODE("width", { ss_push(display_graph_width()); }),
+  CODE("height", { ss_push(display_graph_height()); }),
+  CODE("RED", { ss_push(RED); }),
+  CODE("GREEN", { ss_push(GREEN); }),
+  CODE("BLUE", { ss_push(BLUE); }),
+  CODE("BLACK", { ss_push(BLACK); }),
+  CODE("WHITE", { ss_push(WHITE); }),
+  CODE("pixel",
+    {
+      DU color = ss_pop();
+      DU y = ss_pop();
+      DU x = ss_pop();
+      if (x > display_graph_width() || x < 0) return;
+      if (y > display_graph_height() || y < 0) return;
+      if (!graphCanvas) return;
+      graphCanvas->drawPixel(x, y, color);
+    }),
+  CODE("line",
+    {
+      DU color = ss_pop();
+      DU y1 = ss_pop();
+      DU x1 = ss_pop();
+      DU y0 = ss_pop();
+      DU x0 = ss_pop();
+      if (x0 > display_graph_width() || x0 < 0) return;
+      if (x0 > display_graph_width() || x1 < 0) return;
+      if (y1 > display_graph_height() || y0 < 0) return;
+      if (y1 > display_graph_height() || y1 < 0) return;
+      if (!graphCanvas) return;
+      graphCanvas->drawLine(x0, y0, x1, y1, color);
+    }),
+  CODE("rect",
+    {
+      DU filled = ss_pop();
+      DU color = ss_pop();
+      DU h = ss_pop();
+      DU w = ss_pop();
+      DU y = ss_pop();
+      DU x = ss_pop();
+      if (x + w > display_graph_width() || x < 0) return;
+      if (y + h > display_graph_height() || y < 0) return;
+      if (!graphCanvas) return;
+      if (filled)
+        graphCanvas->fillRoundRect(x, y, w, h, 0, color);
+      else
+        graphCanvas->drawRoundRect(x, y, w, h, 0, color);
+    }),
+  CODE("circle",
+    {
+      DU filled = ss_pop();
+      DU color = ss_pop();
+      DU r = ss_pop();
+      DU y = ss_pop();
+      DU x = ss_pop();
+      if (x + r > display_graph_width() || x - r < 0) return;
+      if (y + r > display_graph_height() || y - r < 0) return;
+      if (!graphCanvas) return;
+      if (filled)
+        graphCanvas->fillCircle(x, y, r, color);
+      else
+        graphCanvas->drawCircle(x, y, r, color);
+    }),
+  CODE("show",
+    {
+      if (!graphCanvas) return;
+      xSemaphoreTake(displayMux, portMAX_DELAY);
+      graphCanvas->pushSprite(0, 0);
+      xSemaphoreGive(displayMux);
+    }),
+  CODE("clear",
+    {
+      if (!graphCanvas) return;
+      graphCanvas->fillScreen(BLACK);
+      xSemaphoreTake(displayMux, portMAX_DELAY);
+      graphCanvas->pushSprite(0, 0);
+      xSemaphoreGive(displayMux);
+    }),
+  CODE("text",
+    {
+      graphCanvas->setTextColor(ss_pop());
+      DU y = ss_pop();
+      DU x = ss_pop();
+      ss_pop(); // string len
+      if (x + GRAPH_TEXT_OFFSET > display_graph_width() || x < 0) return;
+      if (y + GRAPH_TEXT_OFFSET > display_graph_height() || y < 0) return;
+      if (!graphCanvas) return;
+      graphCanvas->drawString((const char*)ss_pop(), x, y);
+    }),
+};
 
 void mem_stat()
 {
@@ -119,16 +254,16 @@ extern "C" void app_main()
   display.setTextColor(ORANGE);
   display.setTextScroll(false);
 
-  int step = display.height() / (OHIST_DISP_LENGTH + 1);
+  int step = display_step();
 
   int cursor = 0;
   bool cursorVisiblePrev = false;
   int cursorTime = millis();
 
-  auto print_input = [&](int offset = 0, bool cursorVisible = true) {
+  auto input_print = [&](int offset = 0, bool cursorVisible = true) {
     assert(offset >= 0);
     xSemaphoreTake(displayMux, portMAX_DELAY);
-    display.fillRect(0, display.height() - step, M5Cardputer.Display.width(), step, BLACK);
+    display.fillRect(0, display.height() - step, display.width(), step, BLACK);
     display.setCursor(X_OFFSET, display.height() - step / 2 - Y_OFFSET);
     String p;
     if (offset > 0)
@@ -152,7 +287,7 @@ extern "C" void app_main()
 
   mem_stat();
   input = "> ";
-  print_input();
+  input_print();
 
   int ohistOffset = 0;
   int ihistOffset = 0;
@@ -214,18 +349,18 @@ extern "C" void app_main()
         }
       }
 
-      if (status.up && inputMode) {
+      if (status.up && inputMode && !graphMode.load(std::memory_order_relaxed)) {
         int maxOffset = std::max(0, (int)ohist.size() - OHIST_DISP_LENGTH);
         if (ohistOffset < maxOffset) {
           ++ohistOffset;
-          print_hist(ohistOffset);
+          ohist_print(ohistOffset);
         }
       }
 
-      if (status.down && inputMode) {
+      if (status.down && inputMode && !graphMode.load(std::memory_order_relaxed)) {
         if (ohistOffset > 0) {
           ohistOffset--;
-          print_hist(ohistOffset);
+          ohist_print(ohistOffset);
         }
       }
 
@@ -272,14 +407,14 @@ extern "C" void app_main()
           ihistOffset = 0;
           String cmd = input.substring(2);
           if (is_graph(cmd)) {
-            add_ihistory_lines(cmd);
+            ihist_add_lines(cmd);
           }
-          add_ohistory_lines(cmd + " ");
-          print_hist();
+          ohist_add_lines(cmd + " ");
+          ohist_print();
           input = "> ";
           cursor = 0;
           cursorTime = millis();
-          print_input();
+          input_print();
           cmd += '\n';
           forthInput.load(cmd);
         }
@@ -292,7 +427,7 @@ extern "C" void app_main()
     bool cursorVisible = (millis() - cursorTime) / 1000 % 2 == 0;
     if (inputMode && (keyboardEventOccured || cursorVisiblePrev != cursorVisible)) {
       cursorVisiblePrev = cursorVisible;
-      print_input(std::max(0, cursor - MAX_STRING_LENGTH), cursorVisible);
+      input_print(std::max(0, cursor - MAX_STRING_LENGTH), cursorVisible);
     }
     vTaskDelay(20);
   }
@@ -301,8 +436,8 @@ extern "C" void app_main()
 static void forth_output(int size, const char* msg)
 {
   (void)size;
-  add_ohistory_lines(msg);
-  print_hist();
+  ohist_add_lines(msg);
+  ohist_print();
 }
 
 static int forth_input()
@@ -322,6 +457,7 @@ static void forth_task(void* ctx)
 {
   (void)ctx;
   forth_init();
+  dict_add(words, sizeof(words) / sizeof(Code));
   xSemaphoreGive(forthInitSem);
 
   for (;;) {
@@ -335,7 +471,7 @@ static void forth_task(void* ctx)
   }
 }
 
-static void add_ohistory_lines(String input)
+static void ohist_add_lines(String input)
 {
   input.replace("\r", "");
   if (input.isEmpty()) return;
@@ -389,7 +525,7 @@ static void add_ohistory_lines(String input)
   }
 }
 
-static void add_ihistory_lines(String input)
+static void ihist_add_lines(String input)
 {
   ihist.push(input);
   Preferences pref;
@@ -406,16 +542,16 @@ static void add_ihistory_lines(String input)
   pref.end();
 }
 
-static void print_hist(int offset)
+static void ohist_print(int offset)
 {
+  if (graphMode.load(std::memory_order_relaxed)) return;
   assert(offset >= 0);
   assert(ohist.size());
   assert(ohist.size() >= offset);
   xSemaphoreTake(displayMux, portMAX_DELAY);
   M5GFX& display = M5Cardputer.Display;
-  int step = display.height() / (OHIST_DISP_LENGTH + 1);
+  int step = display_step();
   int pos = 1;
-
   display.fillRect(0, 0, display.width(), display.height() - step / 2 - Y_OFFSET, BLACK);
 
   int end = ohist.size() - offset;
@@ -428,6 +564,7 @@ static void print_hist(int offset)
   }
   xSemaphoreGive(displayMux);
 }
+
 static bool is_graph(const String& str)
 {
   for (int i = 0; i < str.length(); i++) {
