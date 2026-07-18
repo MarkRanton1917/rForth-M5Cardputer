@@ -188,6 +188,7 @@ extern "C" void app_main()
         }
         else {
           pendingSymbol = INPUT_BREAK;
+          forth_request_interrupt();
         }
       }
 
