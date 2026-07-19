@@ -73,7 +73,21 @@ static inline DU display_graph_height()
   return M5Cardputer.Display.height() - display_step() / 2 - Y_OFFSET;
 }
 
+void greet()
+{
+  size_t t = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+  size_t f = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  int64_t p = 1000L * f / t;
+  float percent = static_cast<float>(p) * 0.1;
+  int core = xPortGetCoreID();
+  int freq = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  String out = "\nrForth on core[" + String(core) + "]\nat " + String(freq) + "MHz,\nRAM " + String(percent)
+    + "% free\n(" + String(f >> 10) + "/" + String(t >> 10) + " KB)\n";
+  forth_output(out.length(), out.c_str());
+}
+
 static const Code words[] = {
+  CODE("greet", greet()),
   CODE("tone",
     {
       DU duration = ss_pop();
@@ -87,7 +101,7 @@ static const Code words[] = {
         graphCanvas = new M5Canvas(&M5Cardputer.Display);
         graphCanvas->createSprite(display_graph_width(), display_graph_height());
         graphCanvas->fillScreen(BLACK);
-        graphCanvas->setTextSize(1);
+        graphCanvas->setTextSize(0.75);
         graphCanvas->setFont(&fonts::FreeMono9pt7b);
         graphCanvas->setTextScroll(false);
       }
@@ -129,7 +143,7 @@ static const Code words[] = {
       if (y1 > display_graph_height() || y0 < 0) return;
       if (y1 > display_graph_height() || y1 < 0) return;
       if (!graphCanvas) return;
-      graphCanvas->drawLine(x0, y0, x1, y1, color);
+      graphCanvas->drawWideLine(x0, y0, x1, y1, 1, color);
     }),
   CODE("rect",
     {
@@ -190,52 +204,71 @@ static const Code words[] = {
     }),
 };
 
-void mem_stat()
+class SdForthFile : public ForthFile {
+  File file;
+
+public:
+  explicit SdForthFile(File f)
+    : file(f)
+  {
+  }
+  void close() override
+  {
+    file.close();
+    SD.end();
+  }
+  long read(char* buf, long len) override
+  {
+    return file.read((uint8_t*)buf, len);
+  }
+  long write(const char* buf, long len) override
+  {
+    return file.write((const uint8_t*)buf, len);
+  }
+  long read_line(char* buf, long max_len) override
+  {
+    if (!file.available()) return -1;
+    long n = 0;
+    while (n < max_len - 1 && file.available()) {
+      int c = file.read();
+      if (c == '\n' || c < 0) break;
+      buf[n++] = (char)c;
+    }
+    buf[n] = '\0';
+    return n;
+  }
+  bool seek(long pos) override
+  {
+    return file.seek(pos);
+  }
+  long position() override
+  {
+    return file.position();
+  }
+  long size() override
+  {
+    return file.size();
+  }
+};
+
+ForthFile* forth_file_open(const char* path, int fam, bool create)
 {
-  size_t t = heap_caps_get_total_size(MALLOC_CAP_8BIT);
-  size_t f = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-  int64_t p = 1000L * f / t;
-  float percent = static_cast<float>(p) * 0.1;
-  int core = xPortGetCoreID();
-  int freq = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
-  String out = "\nrForth on core[" + String(core) + "]\nat " + String(freq) + "MHz,\nRAM " + String(percent)
-    + "% free\n(" + String(f >> 10) + "/" + String(t >> 10) + " KB)\n";
-  forth_output(out.length(), out.c_str());
+  (void)fam;
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) return nullptr;
+  File f = SD.open(path, create ? FILE_WRITE : FILE_READ);
+  if (!f) {
+    SD.end();
+    return nullptr;
+  }
+  return new SdForthFile(f);
 }
 
-bool forth_include(const char* fname)
+bool forth_file_delete(const char* path)
 {
-  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
-    Serial.println("forth_include: SD card failed or not present");
-    return false;
-  }
-
-  File file = SD.open(fname);
-  if (!file) {
-    Serial.println("forth_include: failed to open file for reading");
-    SD.end();
-    return false;
-  }
-
-  String cmd;
-  while (file.available()) {
-    int r = file.read();
-    if (r == -1) {
-      Serial.println("forth_include: failed to read file");
-      file.close();
-      SD.end();
-      return false;
-    }
-    cmd += (char)r;
-    if (r == '\n') {
-      forth_interpret(cmd.c_str(), NULL);
-      cmd = "";
-    }
-  }
-
-  file.close();
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) return false;
+  bool ok = SD.remove(path);
   SD.end();
-  return true;
+  return ok;
 }
 
 extern "C" void app_main()
@@ -285,7 +318,6 @@ extern "C" void app_main()
   xTaskCreate(forth_task, "ForthTask", 8192, nullptr, 1, nullptr);
   xSemaphoreTake(forthInitSem, portMAX_DELAY);
 
-  mem_stat();
   input = "> ";
   input_print();
 
@@ -457,7 +489,8 @@ static void forth_task(void* ctx)
 {
   (void)ctx;
   forth_init();
-  dict_add(words, sizeof(words) / sizeof(Code));
+  forth_dict_add(words, sizeof(words) / sizeof(Code));
+  greet();
   xSemaphoreGive(forthInitSem);
 
   for (;;) {
